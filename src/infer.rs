@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    hash::Hash,
     ops::Sub,
 };
 
@@ -38,6 +39,18 @@ enum Lit {
     Bool(bool),
 }
 
+impl Lit {
+    fn infer(&self) -> (Subst, Type) {
+        (
+            Subst::default(),
+            match self {
+                Lit::Int(_) => Type::Int,
+                Lit::Bool(_) => Type::Bool,
+            },
+        )
+    }
+}
+
 /// A type expression
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Type {
@@ -51,13 +64,31 @@ enum Type {
     Fun { in_: Box<Self>, out: Box<Self> },
 }
 
+fn var_bind(ident: &Ident, ty: &Type) -> Subst {
+    if ty == &Type::Var(ident.clone()) {
+        Subst::default()
+    } else if ty.free_type_vars().contains(ident) {
+        panic!("Occurs check fails: {ident} vs. {:?}", ty)
+    } else {
+        Subst(HashMap::from([(ident.clone(), ty.clone())]))
+    }
+}
+
 impl Type {
     /// Returns the Most General Unifier of `self` and `other`, a unifier is a substitution S where
     /// `S(t1) == S(t2)`
     fn mgu(&self, other: &Type) -> Subst {
         use Type::*;
         match (self, other) {
-            (Fun { in_: i0, out: o0 }, Fun { in_: i1, out: o1 }) => todo!()
+            (Fun { in_: i0, out: o0 }, Fun { in_: i1, out: o1 }) => {
+                let s1 = i0.mgu(&i1);
+                let s2 = o0.apply(&s1).mgu(&o1.apply(&s1));
+                s2.compose(&s1)
+            }
+            (Var(u), t) => var_bind(u, t),
+            (t, Var(u)) => var_bind(u, t),
+            (Int, Int) | (Bool, Bool) => Subst::default(),
+            (t1, t2) => panic!("Types do not unify: {:?} vs. {:?}", t1, t2),
         }
     }
 }
@@ -71,10 +102,7 @@ struct Scheme {
 
 impl Scheme {
     fn instantiate(&self, gen: &mut TypeVarGen) -> Type {
-        let new_vars = self
-            .names
-            .iter()
-            .map(|_| Type::Var(gen.new_var().to_string()));
+        let new_vars = self.names.iter().map(|_| gen.new_var());
         self.ty
             .apply(&Subst(self.names.iter().cloned().zip(new_vars).collect()))
     }
@@ -97,18 +125,32 @@ impl Default for Subst {
     }
 }
 
+trait Union {
+    fn union(&self, other: &Self) -> Self;
+}
+
+/// Implement union for HashMap such that the value in `self` is used over the value in `other` in
+/// the event of a collision.
+impl<K, V> Union for HashMap<K, V>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    fn union(&self, other: &Self) -> Self {
+        let mut res = self.clone();
+        for (key, value) in other {
+            res.entry(key.clone()).or_insert(value.clone());
+        }
+        res
+    }
+}
+
 impl Subst {
     /// Compose `self` with `s2` by unioning `self` with the substitution created by the application of `self` to every type in `other`
     fn compose(&self, s2: &Self) -> Self {
         let (Self(s1), Self(s2)) = (self, s2);
         let s2: HashMap<Ident, Type> = s2.iter().map(|(k, v)| (k.clone(), v.apply(self))).collect();
-
-        // The union of `s1` and `s2`
-        let mut s3 = s1.clone();
-        for (key, value) in s2 {
-            s3.entry(key.clone()).or_insert(value.clone());
-        }
-
+        let s3 = s1.union(&s2);
         Subst(s3)
     }
 
@@ -213,6 +255,36 @@ impl TypeEnv {
             ty: ty.clone(),
         }
     }
+
+    fn infer(&self, gen: &mut TypeVarGen, expr: &Expr) -> (Subst, Type) {
+        match (self, expr) {
+            (TypeEnv(env), Expr::Var(var)) => match env.get(var) {
+                Some(sigma) => (Subst::default(), sigma.instantiate(gen)),
+                None => panic!("Unbound variable: {var}"),
+            },
+            (_, Expr::Lit(lit)) => lit.infer(),
+            (env, Expr::Abs { arg, body }) => {
+                let typevar = gen.new_var();
+                let env1 = self.remove(&arg);
+                let env2 = Self(env1.0.union(&HashMap::from([(
+                    arg.clone(),
+                    Scheme {
+                        names: HashSet::new(),
+                        ty: typevar,
+                    },
+                )])));
+                let (s1, t1) = env2.infer(gen, body);
+                (
+                    s1,
+                    Type::Fun {
+                        in_: todo!(),
+                        out: todo!(),
+                    },
+                )
+            }
+            _ => unimplemented!(),
+        }
+    }
 }
 
 impl Types for TypeEnv {
@@ -252,9 +324,9 @@ impl Default for TypeVarGen {
 }
 
 impl TypeVarGen {
-    pub fn new_var(&mut self) -> TypeVar {
+    pub fn new_var(&mut self) -> Type {
         let var = TypeVar(self.supply);
         self.supply += 1;
-        var
+        Type::Var(var.to_string())
     }
 }
